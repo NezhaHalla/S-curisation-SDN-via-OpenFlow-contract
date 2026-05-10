@@ -76,21 +76,16 @@ def create_topology():
     #   Edge s7 → 10.0.4.0/24
     info('*** Adding Hosts\n')
 
-    # Subnet 1 (s4): Server + Client
-    h1 = net.addHost('h1', ip='10.0.1.1/24', defaultRoute='via 10.0.1.254')  # Server
-    h2 = net.addHost('h2', ip='10.0.1.2/24', defaultRoute='via 10.0.1.254')  # Client
-
-    # Subnet 2 (s5): Client + Server
-    h3 = net.addHost('h3', ip='10.0.2.1/24', defaultRoute='via 10.0.2.254')  # Client
-    h4 = net.addHost('h4', ip='10.0.2.2/24', defaultRoute='via 10.0.2.254')  # Server
-
-    # Subnet 3 (s6): Clients
-    h5 = net.addHost('h5', ip='10.0.3.1/24', defaultRoute='via 10.0.3.254')  # Client
-    h6 = net.addHost('h6', ip='10.0.3.2/24', defaultRoute='via 10.0.3.254')  # Client
-
-    # Subnet 4 (s7): Attacker + Honeypot
-    h7 = net.addHost('h7', ip='10.0.4.1/24', defaultRoute='via 10.0.4.254')  # Attacker
-    h8 = net.addHost('h8', ip='10.0.4.2/24', defaultRoute='via 10.0.4.254')  # Honeypot
+    # All hosts in same subnet (10.0.0.x/24)
+    # SDN controller handles segmentation via flow rules — no need for traditional subnets
+    h1 = net.addHost('h1', ip='10.0.0.1/24', mac='00:00:00:00:00:01')  # Server
+    h2 = net.addHost('h2', ip='10.0.0.2/24', mac='00:00:00:00:00:02')  # Client
+    h3 = net.addHost('h3', ip='10.0.0.3/24', mac='00:00:00:00:00:03')  # Client
+    h4 = net.addHost('h4', ip='10.0.0.4/24', mac='00:00:00:00:00:04')  # Server
+    h5 = net.addHost('h5', ip='10.0.0.5/24', mac='00:00:00:00:00:05')  # Client
+    h6 = net.addHost('h6', ip='10.0.0.6/24', mac='00:00:00:00:00:06')  # Client
+    h7 = net.addHost('h7', ip='10.0.0.7/24', mac='00:00:00:00:00:07')  # Attacker
+    h8 = net.addHost('h8', ip='10.0.0.8/24', mac='00:00:00:00:00:08')  # Honeypot
 
     # ──────────────────────────────────────────────
     # STEP 4: Create links with bandwidth limits
@@ -153,14 +148,14 @@ def create_topology():
     info('    Aggregation:  s2, s3 (cross-linked)\n')
     info('    Edge:         s4, s5 (dual-homed), s6 (dual-homed), s7\n')
     info('    Hosts:\n')
-    info('      h1 (10.0.1.1) - Server    [s4]\n')
-    info('      h2 (10.0.1.2) - Client    [s4]\n')
-    info('      h3 (10.0.2.1) - Client    [s5]\n')
-    info('      h4 (10.0.2.2) - Server    [s5]\n')
-    info('      h5 (10.0.3.1) - Client    [s6]\n')
-    info('      h6 (10.0.3.2) - Client    [s6]\n')
-    info('      h7 (10.0.4.1) - Attacker  [s7]\n')
-    info('      h8 (10.0.4.2) - Honeypot  [s7]\n')
+    info('      h1 (10.0.0.1) - Server    [s4]\n')
+    info('      h2 (10.0.0.2) - Client    [s4]\n')
+    info('      h3 (10.0.0.3) - Client    [s5]\n')
+    info('      h4 (10.0.0.4) - Server    [s5]\n')
+    info('      h5 (10.0.0.5) - Client    [s6]\n')
+    info('      h6 (10.0.0.6) - Client    [s6]\n')
+    info('      h7 (10.0.0.7) - Attacker  [s7]\n')
+    info('      h8 (10.0.0.8) - Honeypot  [s7]\n')
     info('    Links: 16 total (10 base + 3 redundant + 3 not counted above)\n')
     info('\n')
 
