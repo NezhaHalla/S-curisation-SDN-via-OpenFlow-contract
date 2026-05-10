@@ -1,0 +1,20 @@
+# SDN Controller
+os-ken>=4.2.0
+
+# Blockchain
+web3>=6.0.0
+py-solc-x>=2.0.0
+
+# Network tools
+scapy>=2.5.0
+
+# Visualization & Dashboard
+flask>=3.0.0
+matplotlib>=3.8.0
+pandas>=2.0.0
+numpy>=1.26.0
+networkx>=3.0
+
+# Utilities
+eventlet>=0.35.0
+requests>=2.31.0
