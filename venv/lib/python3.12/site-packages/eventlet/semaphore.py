@@ -4,7 +4,7 @@ import eventlet
 from eventlet import hubs
 
 
-class Semaphore(object):
+class Semaphore:
 
     """An unbounded semaphore.
     Optionally initialize with a resource *count*, then :meth:`acquire` and
@@ -34,12 +34,11 @@ class Semaphore(object):
         try:
             value = int(value)
         except ValueError as e:
-            msg = 'Semaphore() expect value :: int, actual: {0} {1}'.format(type(value), str(e))
+            msg = 'Semaphore() expect value :: int, actual: {} {}'.format(type(value), str(e))
             raise TypeError(msg)
         if value < 0:
-            msg = 'Semaphore() expect value >= 0, actual: {0}'.format(repr(value))
+            msg = 'Semaphore() expect value >= 0, actual: {}'.format(repr(value))
             raise ValueError(msg)
-        self._original_value = value
         self.counter = value
         self._waiters = collections.deque()
 
@@ -51,10 +50,6 @@ class Semaphore(object):
     def __str__(self):
         params = (self.__class__.__name__, self.counter, len(self._waiters))
         return '<%s c=%s _w[%s]>' % params
-
-    def _at_fork_reinit(self):
-        self.counter = self._original_value
-        self._waiters.clear()
 
     def locked(self):
         """Returns true if a call to acquire would block.
@@ -181,7 +176,7 @@ class BoundedSemaphore(Semaphore):
     """
 
     def __init__(self, value=1):
-        super(BoundedSemaphore, self).__init__(value)
+        super().__init__(value)
         self.original_counter = value
 
     def release(self, blocking=True):
@@ -195,10 +190,10 @@ class BoundedSemaphore(Semaphore):
         """
         if self.counter >= self.original_counter:
             raise ValueError("Semaphore released too many times")
-        return super(BoundedSemaphore, self).release(blocking)
+        return super().release(blocking)
 
 
-class CappedSemaphore(object):
+class CappedSemaphore:
 
     """A blockingly bounded semaphore.
 

@@ -109,12 +109,12 @@ def create_topology():
     # --- REDUNDANT LINKS ---
     # Cross-link between aggregation switches (50 Mbps)
     # Purpose: If core switch fails, traffic can still flow between halves
-    net.addLink(s2, s3, bw=50, delay='2ms')
+    #! net.addLink(s2, s3, bw=50, delay='2ms')
 
     # Dual-homing: s5 also connects to s3, s6 also connects to s2
     # Purpose: Edge switches have backup paths through alternate aggregation
-    net.addLink(s5, s3, bw=50, delay='2ms')
-    net.addLink(s6, s2, bw=50, delay='2ms')
+    #! net.addLink(s5, s3, bw=50, delay='2ms')
+    #! net.addLink(s6, s2, bw=50, delay='2ms')
 
     # --- Edge ↔ Hosts (10 Mbps) ---
     net.addLink(s4, h1, bw=10, delay='5ms')
