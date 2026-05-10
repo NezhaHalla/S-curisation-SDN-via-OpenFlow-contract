@@ -260,6 +260,10 @@ class SecurityController(app_manager.OSKenApp):
                     "[HOST DISCOVERED] %s (MAC: %s) on Switch s%s, Port %s",
                     src_ip, src_mac, dpid, in_port
                 )
+            
+            # Try ARP proxy — if we can answer, no flooding needed
+            if self._handle_arp(datapath, in_port, pkt, arp_pkt):
+                return  # ARP handled, no need to continue
 
         # ── Forwarding decision ──
         # Check if we know the destination host
@@ -393,9 +397,118 @@ class SecurityController(app_manager.OSKenApp):
         )
         datapath.send_msg(out)
 
+    def _handle_arp(self, datapath, in_port, pkt, arp_pkt):
+        """
+        ARP Proxy: Handle ARP requests directly from the controller.
+        
+        Instead of flooding ARP requests (which causes storms with redundant links),
+        the controller replies directly when it knows the answer.
+        
+        This is a KEY SDN technique:
+        - Traditional network: ARP broadcasts to ALL hosts (wasteful, causes storms)
+        - SDN with ARP proxy: Controller answers immediately (fast, no storms)
+        """
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        
+        # Only handle ARP REQUESTS (opcode 1), not ARP REPLIES (opcode 2)
+        if arp_pkt.opcode != arp.ARP_REQUEST:
+            return False
+        
+        requested_ip = arp_pkt.dst_ip
+        
+        # Do we know this IP?
+        if requested_ip in self.hosts:
+            # YES! Generate an ARP reply
+            known_mac = self.hosts[requested_ip]['mac']
+            
+            self.logger.info(
+                "[ARP PROXY] Replying: %s is at %s (asked by %s)",
+                requested_ip, known_mac, arp_pkt.src_ip
+            )
+            
+            # Build ARP reply packet
+            eth_reply = ethernet.ethernet(
+                dst=arp_pkt.src_mac,
+                src=known_mac,
+                ethertype=ether_types.ETH_TYPE_ARP
+            )
+            arp_reply = arp.arp(
+                opcode=arp.ARP_REPLY,
+                src_mac=known_mac,
+                src_ip=requested_ip,
+                dst_mac=arp_pkt.src_mac,
+                dst_ip=arp_pkt.src_ip
+            )
+            reply_pkt = packet.Packet()
+            reply_pkt.add_protocol(eth_reply)
+            reply_pkt.add_protocol(arp_reply)
+            reply_pkt.serialize()
+            
+            # Send the reply back to the requesting host
+            actions = [parser.OFPActionOutput(in_port)]
+            out = parser.OFPPacketOut(
+                datapath=datapath,
+                buffer_id=ofproto.OFP_NO_BUFFER,
+                in_port=ofproto.OFPP_CONTROLLER,
+                actions=actions,
+                data=reply_pkt.data
+            )
+            datapath.send_msg(out)
+            return True
+        
+        else:
+            # We don't know this IP yet — flood carefully using spanning tree
+            self.logger.info(
+                "[ARP PROXY] Unknown IP %s — flooding via spanning tree",
+                requested_ip
+            )
+            return False
+
     def _flood(self, datapath, parser, ofproto, msg, in_port):
-        """Flood a packet to all ports (fallback when destination is unknown)."""
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        """
+        Smart flood using spanning tree to prevent loops.
+        
+        Instead of OFPP_FLOOD (all ports — causes loops), we:
+        1. Compute a spanning tree of the topology
+        2. Only send out ports that are part of the spanning tree + host ports
+        """
+        dpid = datapath.id
+        
+        # Get all ports on this switch
+        # Determine which ports connect to other switches (from topology)
+        switch_ports = set()
+        for neighbor in self.topology_graph.neighbors(dpid):
+            edge_data = self.topology_graph[dpid][neighbor]
+            switch_ports.add(edge_data['src_port'])
+        
+        # Compute spanning tree ports (only tree edges, no redundant links)
+        tree_ports = set()
+        if self.topology_graph.number_of_nodes() > 0:
+            try:
+                spanning_tree = nx.minimum_spanning_tree(self.topology_graph)
+                for neighbor in spanning_tree.neighbors(dpid):
+                    edge_data = self.topology_graph[dpid][neighbor]
+                    tree_ports.add(edge_data['src_port'])
+            except Exception:
+                tree_ports = switch_ports  # Fallback to all switch ports
+        
+        # Get all ports on the datapath
+        all_ports = set()
+        for p in datapath.ports.values():
+            if p.port_no != ofproto.OFPP_LOCAL and p.port_no != in_port:
+                all_ports.add(p.port_no)
+        
+        # Host ports = all ports minus switch-to-switch ports
+        host_ports = all_ports - switch_ports
+        
+        # Flood to: spanning tree ports + host ports (but not in_port)
+        flood_ports = (tree_ports | host_ports) - {in_port}
+        
+        if not flood_ports:
+            return
+        
+        actions = [parser.OFPActionOutput(port) for port in flood_ports]
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,
