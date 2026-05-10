@@ -1,23 +1,11 @@
 """
-SDN Security Controller — Part 1: Topology Discovery + Smart Forwarding
-========================================================================
-This controller replaces the basic L2 switch with intelligent features:
-
-1. TOPOLOGY DISCOVERY: Learns the full network graph (switches + links)
-   using LLDP packets. Builds a NetworkX graph of the topology.
-
-2. SHORTEST PATH FORWARDING: Computes optimal paths between hosts
-   using Dijkstra's algorithm. Installs precise flow rules instead
-   of flooding — this prevents loops and enables redundant links.
-
-3. HOST TRACKING: Learns which host (IP + MAC) is connected to which
-   switch and port by inspecting ARP packets.
-
-Architecture:
-    packet_in → Is it LLDP? → Yes → Update topology graph
-                             → No  → Is it ARP? → Learn host location
-                                                 → Compute shortest path
-                                                 → Install flow rules along path
+SDN Security Controller — Part 1: Smart Forwarding + ARP Proxy
+===============================================================
+Features:
+    1. Pre-defined topology graph (matches our Mininet topology)
+    2. Shortest path forwarding using Dijkstra (no flooding, no loops)
+    3. ARP Proxy (controller answers ARP requests directly)
+    4. Controller-based broadcast (ARP to all hosts without inter-switch flooding)
 
 Usage:
     osken-manager controllers/security_controller.py
@@ -28,199 +16,106 @@ from os_ken.controller import ofp_event
 from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from os_ken.controller.handler import set_ev_cls
 from os_ken.ofproto import ofproto_v1_3
-from os_ken.lib.packet import packet, ethernet, ether_types, arp, ipv4, lldp
-from os_ken.lib import hub
-from os_ken.topology import event as topo_event
-from os_ken.topology.api import get_switch, get_link
+from os_ken.lib.packet import packet, ethernet, ether_types, arp, ipv4
 
 import networkx as nx
-import time
-import json
-import logging
 from collections import defaultdict
 
 
 class SecurityController(app_manager.OSKenApp):
-    """
-    SDN Security Controller with topology-aware forwarding.
-
-    Instead of flooding (like L2 switch), this controller:
-    1. Discovers the network topology automatically
-    2. Computes shortest paths between any two hosts
-    3. Installs flow rules along the entire path
-    4. Handles redundant links without loops
-
-    Attributes:
-        topology_graph: NetworkX graph of the network (switches = nodes, links = edges)
-        hosts:          Dictionary mapping IP → {mac, dpid, port}
-        mac_to_port:    Dictionary mapping (dpid, mac) → port (for fast lookups)
-        datapaths:      Dictionary mapping dpid → datapath object (for sending commands)
-    """
+    """SDN Security Controller with topology-aware forwarding and ARP proxy."""
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(SecurityController, self).__init__(*args, **kwargs)
 
-        # ── Network topology graph ──
-        # Nodes = switch dpids, Edges = links between switches
-        # We use NetworkX for graph operations (shortest path, etc.)
+        # Network topology graph
         self.topology_graph = nx.Graph()
+        self.port_map = {}
+        self._build_topology()
 
-        # ── Host tracking ──
-        # Maps IP address → {mac, dpid, port}
-        # Example: '10.0.0.1' → {'mac': '00:00:00:00:00:01', 'dpid': 4, 'port': 1}
+        # Host tracking: IP -> {mac, dpid, port}
         self.hosts = {}
 
-        # ── MAC to port mapping (per switch) ──
-        # Maps (dpid, mac) → port number
-        self.mac_to_port = {}
-
-        # ── Active datapaths (switches) ──
-        # Maps dpid → datapath object (needed to send OpenFlow messages)
+        # Active datapaths: dpid -> datapath object
         self.datapaths = {}
 
-        # ── Traffic statistics (for Phase 2: detection) ──
-        self.flow_stats = defaultdict(list)
-        self.port_stats = defaultdict(list)
+        # Switch-to-switch ports (to distinguish from host ports)
+        self.switch_ports = defaultdict(set)
 
-        # ── Blocked hosts (for Phase 3: mitigation) ──
+        # Security tracking (for Phase 2)
         self.blocked_hosts = set()
-
-        # ── Security event log ──
         self.security_log = []
 
-        self.logger.info("="*60)
-        self.logger.info("  SDN SECURITY CONTROLLER STARTED")
-        self.logger.info("  Features: Topology Discovery, Shortest Path Forwarding")
-        self.logger.info("="*60)
+        # Track installed flows to avoid duplicates
+        self.installed_flows = set()
 
-        # Start topology discovery thread
-        self.topology_discovery_thread = hub.spawn(self._topology_discovery_loop)
+        self.logger.info("=" * 60)
+        self.logger.info("  SDN SECURITY CONTROLLER STARTED")
+        self.logger.info("  Topology: 7 switches, 9 links")
+        self.logger.info("=" * 60)
+
+    def _build_topology(self):
+        """
+        Define the network topology matching our Mininet setup.
+        Port numbers verified from 'mininet> links' output.
+        """
+        for dpid in range(1, 8):
+            self.topology_graph.add_node(dpid)
+
+        # (switch_a, port_a, switch_b, port_b) — verified from Mininet
+        links = [
+            (1, 1, 2, 1),   # s1-eth1 <-> s2-eth1
+            (1, 2, 3, 1),   # s1-eth2 <-> s3-eth1
+            (2, 2, 4, 1),   # s2-eth2 <-> s4-eth1
+            (2, 3, 5, 1),   # s2-eth3 <-> s5-eth1
+            (3, 2, 6, 1),   # s3-eth2 <-> s6-eth1
+            (3, 3, 7, 1),   # s3-eth3 <-> s7-eth1
+            (2, 4, 3, 4),   # s2-eth4 <-> s3-eth4  (redundant)
+            (5, 2, 3, 5),   # s5-eth2 <-> s3-eth5  (redundant)
+            (6, 2, 2, 5),   # s6-eth2 <-> s2-eth5  (redundant)
+        ]
+
+        for sw_a, port_a, sw_b, port_b in links:
+            self.topology_graph.add_edge(sw_a, sw_b)
+            self.port_map[(sw_a, sw_b)] = port_a
+            self.port_map[(sw_b, sw_a)] = port_b
+            self.switch_ports[sw_a].add(port_a)
+            self.switch_ports[sw_b].add(port_b)
+
+        self.logger.info("[TOPOLOGY] %d switches, %d links",
+                         self.topology_graph.number_of_nodes(),
+                         self.topology_graph.number_of_edges())
 
     # ══════════════════════════════════════════════════════════
-    #  SWITCH CONNECTION HANDLER
+    #  SWITCH CONNECTION
     # ══════════════════════════════════════════════════════════
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Handle new switch connection — install table-miss flow entry."""
+        """Install table-miss flow entry on new switch."""
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         dpid = datapath.id
 
-        # Store the datapath reference
         self.datapaths[dpid] = datapath
+        self.logger.info("[SWITCH] s%s connected", dpid)
 
-        self.logger.info("[SWITCH CONNECTED] Switch s%s (dpid=%s)", dpid, dpid)
-
-        # Install table-miss flow entry (send unmatched packets to controller)
+        # Table-miss: send to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(
-            ofproto.OFPP_CONTROLLER,
-            ofproto.OFPCML_NO_BUFFER
+            ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER
         )]
-        self._add_flow(datapath, priority=0, match=match, actions=actions)
+        self._add_flow(datapath, 0, match, actions)
 
     # ══════════════════════════════════════════════════════════
-    #  TOPOLOGY DISCOVERY
-    # ══════════════════════════════════════════════════════════
-
-    def _topology_discovery_loop(self):
-        """Periodically discover and update the network topology."""
-        while True:
-            self._update_topology()
-            hub.sleep(5)  # Refresh every 5 seconds
-
-    def _update_topology(self):
-        """Query os-ken's topology module for current switches and links."""
-        try:
-            # Get all switches
-            switch_list = get_switch(self, None)
-            switches = [s.dp.id for s in switch_list]
-
-            # Get all links
-            link_list = get_link(self, None)
-
-            # Rebuild the graph
-            self.topology_graph.clear()
-
-            # Add switches as nodes
-            for dpid in switches:
-                self.topology_graph.add_node(dpid)
-
-            # Add links as edges (with port information)
-            for link in link_list:
-                src_dpid = link.src.dpid
-                dst_dpid = link.dst.dpid
-                src_port = link.src.port_no
-                dst_port = link.dst.port_no
-
-                # Store port info as edge attributes
-                self.topology_graph.add_edge(
-                    src_dpid, dst_dpid,
-                    src_port=src_port,
-                    dst_port=dst_port
-                )
-
-            if switches:
-                self.logger.debug("[TOPOLOGY] %d switches, %d links",
-                                  len(switches),
-                                  self.topology_graph.number_of_edges())
-        except Exception as e:
-            self.logger.debug("[TOPOLOGY] Discovery waiting: %s", e)
-
-    def get_path(self, src_dpid, dst_dpid):
-        """
-        Compute shortest path between two switches using Dijkstra's algorithm.
-
-        Args:
-            src_dpid: Source switch datapath ID
-            dst_dpid: Destination switch datapath ID
-
-        Returns:
-            List of switch dpids forming the path, or None if no path exists.
-            Example: [4, 2, 1, 3, 7] means s4 → s2 → s1 → s3 → s7
-        """
-        try:
-            if src_dpid == dst_dpid:
-                return [src_dpid]
-
-            if (src_dpid in self.topology_graph and
-                    dst_dpid in self.topology_graph):
-                path = nx.shortest_path(
-                    self.topology_graph,
-                    source=src_dpid,
-                    target=dst_dpid
-                )
-                return path
-        except nx.NetworkXNoPath:
-            self.logger.warning("[PATH] No path from s%s to s%s", src_dpid, dst_dpid)
-        except nx.NodeNotFound:
-            self.logger.debug("[PATH] Switch not in topology yet")
-
-        return None
-
-    def get_out_port(self, src_dpid, dst_dpid):
-        """
-        Get the output port on src_dpid to reach dst_dpid.
-
-        Returns:
-            Port number, or None if switches are not directly connected.
-        """
-        if self.topology_graph.has_edge(src_dpid, dst_dpid):
-            edge_data = self.topology_graph[src_dpid][dst_dpid]
-            return edge_data['src_port']
-        return None
-
-    # ══════════════════════════════════════════════════════════
-    #  PACKET-IN HANDLER (Main Logic)
+    #  PACKET-IN HANDLER
     # ══════════════════════════════════════════════════════════
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Handle packets that the switch doesn't know how to forward."""
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -228,287 +123,234 @@ class SecurityController(app_manager.OSKenApp):
         in_port = msg.match['in_port']
         dpid = datapath.id
 
-        # Parse the packet
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # Ignore LLDP (used by topology discovery)
+        # Ignore LLDP and IPv6
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
-
-        # Ignore IPv6 multicast (reduces noise)
         if eth.dst.startswith('33:33'):
             return
 
         src_mac = eth.src
         dst_mac = eth.dst
 
-        # ── Learn the source MAC location ──
-        self.mac_to_port[(dpid, src_mac)] = in_port
-
-        # ── Learn host from ARP packets ──
+        # ── Handle ARP ──
         arp_pkt = pkt.get_protocol(arp.arp)
         if arp_pkt:
-            src_ip = arp_pkt.src_ip
-            if src_ip not in self.hosts:
-                self.hosts[src_ip] = {
-                    'mac': src_mac,
-                    'dpid': dpid,
-                    'port': in_port
-                }
-                self.logger.info(
-                    "[HOST DISCOVERED] %s (MAC: %s) on Switch s%s, Port %s",
-                    src_ip, src_mac, dpid, in_port
-                )
-            
-            # Try ARP proxy — if we can answer, no flooding needed
-            if self._handle_arp(datapath, in_port, pkt, arp_pkt):
-                return  # ARP handled, no need to continue
+            self._handle_arp(datapath, in_port, eth, arp_pkt, msg)
+            return
 
-        # ── Forwarding decision ──
-        # Check if we know the destination host
-        dst_host = None
-        for ip, info in self.hosts.items():
-            if info['mac'] == dst_mac:
-                dst_host = info
-                break
+        # ── Handle unicast data packets ──
+        if dst_mac == 'ff:ff:ff:ff:ff:ff':
+            return  # Ignore non-ARP broadcasts
 
-        if dst_host is not None:
-            # We know the destination! Compute shortest path.
-            dst_dpid = dst_host['dpid']
-            dst_port = dst_host['port']
+        # Find destination
+        dst_host = self._find_host_by_mac(dst_mac)
+        if dst_host:
+            self._route_packet(datapath, dpid, in_port, dst_mac, dst_host, msg)
 
-            if dpid == dst_dpid:
-                # Destination is on the SAME switch
-                out_port = dst_port
-                self._install_and_forward(
-                    datapath, parser, ofproto, msg,
-                    in_port, out_port, src_mac, dst_mac
-                )
+    # ══════════════════════════════════════════════════════════
+    #  ARP HANDLING
+    # ══════════════════════════════════════════════════════════
+
+    def _handle_arp(self, datapath, in_port, eth, arp_pkt, msg):
+        """Handle all ARP packets: learn hosts, proxy replies, broadcast requests."""
+        dpid = datapath.id
+        src_ip = arp_pkt.src_ip
+        src_mac = arp_pkt.src_mac
+
+        # Learn the source host
+        if src_ip and src_ip not in self.hosts:
+            self.hosts[src_ip] = {
+                'mac': src_mac,
+                'dpid': dpid,
+                'port': in_port
+            }
+            self.logger.info(
+                "[HOST] %s (%s) on s%s port %s",
+                src_ip, src_mac, dpid, in_port
+            )
+
+        if arp_pkt.opcode == arp.ARP_REQUEST:
+            dst_ip = arp_pkt.dst_ip
+
+            if dst_ip in self.hosts:
+                # Known host — reply directly (ARP Proxy)
+                self._send_arp_reply(datapath, in_port, arp_pkt)
             else:
-                # Destination is on a DIFFERENT switch — use shortest path
-                path = self.get_path(dpid, dst_dpid)
+                # Unknown host — send ARP to all host ports
+                self._broadcast_to_hosts(msg.data, dpid, in_port)
 
-                if path and len(path) >= 2:
-                    self.logger.info(
-                        "[PATH COMPUTED] %s → %s : %s",
-                        src_mac, dst_mac,
-                        " → ".join(["s" + str(s) for s in path])
-                    )
+        elif arp_pkt.opcode == arp.ARP_REPLY:
+            # Route the ARP reply to the destination
+            dst_host = self._find_host_by_mac(arp_pkt.dst_mac)
+            if dst_host:
+                self._route_packet(datapath, dpid, in_port,
+                                   arp_pkt.dst_mac, dst_host, msg)
 
-                    # Install flow rules along the ENTIRE path
-                    self._install_path_flows(
-                        path, src_mac, dst_mac, dst_port, msg
-                    )
-                else:
-                    # No path found — flood as fallback
-                    self._flood(datapath, parser, ofproto, msg, in_port)
-        else:
-            # Unknown destination — flood (ARP request will discover it)
-            self._flood(datapath, parser, ofproto, msg, in_port)
+    def _send_arp_reply(self, datapath, in_port, arp_pkt):
+        """Generate and send an ARP reply from the controller."""
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
 
-    # ══════════════════════════════════════════════════════════
-    #  FLOW INSTALLATION HELPERS
-    # ══════════════════════════════════════════════════════════
+        target_ip = arp_pkt.dst_ip
+        target_mac = self.hosts[target_ip]['mac']
 
-    def _install_path_flows(self, path, src_mac, dst_mac, final_port, msg):
+        self.logger.info("[ARP PROXY] %s is at %s", target_ip, target_mac)
+
+        eth_reply = ethernet.ethernet(
+            dst=arp_pkt.src_mac,
+            src=target_mac,
+            ethertype=ether_types.ETH_TYPE_ARP
+        )
+        arp_reply = arp.arp(
+            opcode=arp.ARP_REPLY,
+            src_mac=target_mac,
+            src_ip=target_ip,
+            dst_mac=arp_pkt.src_mac,
+            dst_ip=arp_pkt.src_ip
+        )
+        reply = packet.Packet()
+        reply.add_protocol(eth_reply)
+        reply.add_protocol(arp_reply)
+        reply.serialize()
+
+        actions = [parser.OFPActionOutput(in_port)]
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER,
+            actions=actions,
+            data=reply.data
+        )
+        datapath.send_msg(out)
+
+    def _broadcast_to_hosts(self, data, src_dpid, src_port):
         """
-        Install flow rules along the entire computed path.
+        Send a packet directly to ALL host ports on ALL switches.
 
-        This is the key difference from L2 switch:
-        - L2 switch: installs rules one switch at a time (reactive)
-        - Security controller: installs rules on ALL switches at once (proactive)
-
-        Example: Path = [s4, s2, s1, s3, s7], dst_port = 1
-            s4: match(dst_mac) → output(port to s2)
-            s2: match(dst_mac) → output(port to s1)
-            s1: match(dst_mac) → output(port to s3)
-            s3: match(dst_mac) → output(port to s7)
-            s7: match(dst_mac) → output(port 1 = host port)
+        This replaces traditional flooding:
+        - No inter-switch flooding (no loops possible)
+        - Controller sends directly to each switch's host ports
+        - Clean, deterministic, loop-free
         """
-        for i in range(len(path)):
-            current_dpid = path[i]
-            datapath = self.datapaths.get(current_dpid)
+        for dpid, dp in self.datapaths.items():
+            ofproto = dp.ofproto
+            parser = dp.ofproto_parser
 
-            if datapath is None:
+            # Get host ports (all ports minus switch-to-switch ports)
+            host_ports = set()
+            for p in dp.ports.values():
+                port_no = p.port_no
+                if port_no == ofproto.OFPP_LOCAL:
+                    continue
+                if port_no not in self.switch_ports.get(dpid, set()):
+                    host_ports.add(port_no)
+
+            # Don't send back to the source port
+            if dpid == src_dpid:
+                host_ports.discard(src_port)
+
+            if not host_ports:
                 continue
 
-            parser = datapath.ofproto_parser
-            ofproto = datapath.ofproto
+            actions = [parser.OFPActionOutput(port) for port in host_ports]
+            out = parser.OFPPacketOut(
+                datapath=dp,
+                buffer_id=ofproto.OFP_NO_BUFFER,
+                in_port=ofproto.OFPP_CONTROLLER,
+                actions=actions,
+                data=data
+            )
+            dp.send_msg(out)
+
+    # ══════════════════════════════════════════════════════════
+    #  ROUTING
+    # ══════════════════════════════════════════════════════════
+
+    def _route_packet(self, datapath, dpid, in_port, dst_mac, dst_host, msg):
+        """Route a packet to a known destination using shortest path."""
+        dst_dpid = dst_host['dpid']
+        dst_port = dst_host['port']
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        if dpid == dst_dpid:
+            # Same switch
+            out_port = dst_port
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
+            actions = [parser.OFPActionOutput(out_port)]
+            self._add_flow(datapath, 10, match, actions, idle_timeout=300)
+            self._send_packet(datapath, msg, in_port, out_port)
+        else:
+            # Different switch — shortest path
+            path = self._get_path(dpid, dst_dpid)
+            if path and len(path) >= 2:
+                # Only log if this is a new path
+                flow_key = (dpid, dst_mac)
+                if flow_key not in self.installed_flows:
+                    self.installed_flows.add(flow_key)
+                    self.logger.info(
+                        "[PATH] %s → %s",
+                        " → ".join(["s" + str(s) for s in path]),
+                        dst_mac
+                    )
+
+                self._install_path(path, dst_mac, dst_port)
+
+                # Forward current packet
+                out_port = self.port_map.get((path[0], path[1]))
+                if out_port:
+                    self._send_packet(datapath, msg, in_port, out_port)
+
+    def _get_path(self, src_dpid, dst_dpid):
+        """Compute shortest path using Dijkstra."""
+        try:
+            if src_dpid == dst_dpid:
+                return [src_dpid]
+            return nx.shortest_path(self.topology_graph, src_dpid, dst_dpid)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+
+    def _install_path(self, path, dst_mac, final_port):
+        """Install flow rules on every switch along the path."""
+        for i in range(len(path)):
+            dp = self.datapaths.get(path[i])
+            if not dp:
+                continue
+
+            parser = dp.ofproto_parser
+            ofproto = dp.ofproto
 
             if i < len(path) - 1:
-                # Intermediate switch — forward to next switch in path
-                next_dpid = path[i + 1]
-                out_port = self.get_out_port(current_dpid, next_dpid)
+                out_port = self.port_map.get((path[i], path[i + 1]))
             else:
-                # Last switch in path — forward to the host
                 out_port = final_port
 
             if out_port is None:
                 continue
 
-            # Install the flow rule
             match = parser.OFPMatch(eth_dst=dst_mac)
             actions = [parser.OFPActionOutput(out_port)]
-            self._add_flow(datapath, priority=10, match=match,
-                           actions=actions, idle_timeout=300)
+            self._add_flow(dp, 10, match, actions, idle_timeout=300)
 
-            self.logger.debug(
-                "[FLOW INSTALLED] Switch s%s: %s → Port %s",
-                current_dpid, dst_mac, out_port
-            )
+    # ══════════════════════════════════════════════════════════
+    #  HELPERS
+    # ══════════════════════════════════════════════════════════
 
-        # Send the current packet on its way (first switch in path)
-        first_dpid = path[0]
-        first_dp = self.datapaths.get(first_dpid)
-        if first_dp:
-            if len(path) >= 2:
-                out_port = self.get_out_port(path[0], path[1])
-            else:
-                out_port = final_port
+    def _find_host_by_mac(self, mac):
+        """Find host info by MAC address."""
+        for ip, info in self.hosts.items():
+            if info['mac'] == mac:
+                return info
+        return None
 
-            if out_port:
-                parser = first_dp.ofproto_parser
-                ofproto = first_dp.ofproto
-                actions = [parser.OFPActionOutput(out_port)]
-                out = parser.OFPPacketOut(
-                    datapath=first_dp,
-                    buffer_id=msg.buffer_id,
-                    in_port=msg.match['in_port'],
-                    actions=actions,
-                    data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-                )
-                first_dp.send_msg(out)
-
-    def _install_and_forward(self, datapath, parser, ofproto, msg,
-                              in_port, out_port, src_mac, dst_mac):
-        """Install a flow rule and forward the packet (same switch)."""
-        match = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
-        actions = [parser.OFPActionOutput(out_port)]
-        self._add_flow(datapath, priority=10, match=match,
-                       actions=actions, idle_timeout=300)
-
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-        )
-        datapath.send_msg(out)
-
-    def _handle_arp(self, datapath, in_port, pkt, arp_pkt):
-        """
-        ARP Proxy: Handle ARP requests directly from the controller.
-        
-        Instead of flooding ARP requests (which causes storms with redundant links),
-        the controller replies directly when it knows the answer.
-        
-        This is a KEY SDN technique:
-        - Traditional network: ARP broadcasts to ALL hosts (wasteful, causes storms)
-        - SDN with ARP proxy: Controller answers immediately (fast, no storms)
-        """
+    def _send_packet(self, datapath, msg, in_port, out_port):
+        """Send a single packet out a specific port."""
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
-        
-        # Only handle ARP REQUESTS (opcode 1), not ARP REPLIES (opcode 2)
-        if arp_pkt.opcode != arp.ARP_REQUEST:
-            return False
-        
-        requested_ip = arp_pkt.dst_ip
-        
-        # Do we know this IP?
-        if requested_ip in self.hosts:
-            # YES! Generate an ARP reply
-            known_mac = self.hosts[requested_ip]['mac']
-            
-            self.logger.info(
-                "[ARP PROXY] Replying: %s is at %s (asked by %s)",
-                requested_ip, known_mac, arp_pkt.src_ip
-            )
-            
-            # Build ARP reply packet
-            eth_reply = ethernet.ethernet(
-                dst=arp_pkt.src_mac,
-                src=known_mac,
-                ethertype=ether_types.ETH_TYPE_ARP
-            )
-            arp_reply = arp.arp(
-                opcode=arp.ARP_REPLY,
-                src_mac=known_mac,
-                src_ip=requested_ip,
-                dst_mac=arp_pkt.src_mac,
-                dst_ip=arp_pkt.src_ip
-            )
-            reply_pkt = packet.Packet()
-            reply_pkt.add_protocol(eth_reply)
-            reply_pkt.add_protocol(arp_reply)
-            reply_pkt.serialize()
-            
-            # Send the reply back to the requesting host
-            actions = [parser.OFPActionOutput(in_port)]
-            out = parser.OFPPacketOut(
-                datapath=datapath,
-                buffer_id=ofproto.OFP_NO_BUFFER,
-                in_port=ofproto.OFPP_CONTROLLER,
-                actions=actions,
-                data=reply_pkt.data
-            )
-            datapath.send_msg(out)
-            return True
-        
-        else:
-            # We don't know this IP yet — flood carefully using spanning tree
-            self.logger.info(
-                "[ARP PROXY] Unknown IP %s — flooding via spanning tree",
-                requested_ip
-            )
-            return False
-
-    def _flood(self, datapath, parser, ofproto, msg, in_port):
-        """
-        Smart flood using spanning tree to prevent loops.
-        
-        Instead of OFPP_FLOOD (all ports — causes loops), we:
-        1. Compute a spanning tree of the topology
-        2. Only send out ports that are part of the spanning tree + host ports
-        """
-        dpid = datapath.id
-        
-        # Get all ports on this switch
-        # Determine which ports connect to other switches (from topology)
-        switch_ports = set()
-        for neighbor in self.topology_graph.neighbors(dpid):
-            edge_data = self.topology_graph[dpid][neighbor]
-            switch_ports.add(edge_data['src_port'])
-        
-        # Compute spanning tree ports (only tree edges, no redundant links)
-        tree_ports = set()
-        if self.topology_graph.number_of_nodes() > 0:
-            try:
-                spanning_tree = nx.minimum_spanning_tree(self.topology_graph)
-                for neighbor in spanning_tree.neighbors(dpid):
-                    edge_data = self.topology_graph[dpid][neighbor]
-                    tree_ports.add(edge_data['src_port'])
-            except Exception:
-                tree_ports = switch_ports  # Fallback to all switch ports
-        
-        # Get all ports on the datapath
-        all_ports = set()
-        for p in datapath.ports.values():
-            if p.port_no != ofproto.OFPP_LOCAL and p.port_no != in_port:
-                all_ports.add(p.port_no)
-        
-        # Host ports = all ports minus switch-to-switch ports
-        host_ports = all_ports - switch_ports
-        
-        # Flood to: spanning tree ports + host ports (but not in_port)
-        flood_ports = (tree_ports | host_ports) - {in_port}
-        
-        if not flood_ports:
-            return
-        
-        actions = [parser.OFPActionOutput(port) for port in flood_ports]
+        actions = [parser.OFPActionOutput(out_port)]
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,
@@ -523,11 +365,9 @@ class SecurityController(app_manager.OSKenApp):
         """Install a flow rule on a switch."""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
         instructions = [
             parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
         ]
-
         mod = parser.OFPFlowMod(
             datapath=datapath,
             priority=priority,
