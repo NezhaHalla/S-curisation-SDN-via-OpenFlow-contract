@@ -21,9 +21,13 @@ from os_ken.lib import hub
 import networkx as nx
 
 # Our modules
-from controllers.topology_manager import TopologyManager
-from controllers.arp_proxy import ArpProxy
-from controllers.traffic_monitor import TrafficMonitor, MONITOR_INTERVAL
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from topology_manager import TopologyManager
+from arp_proxy import ArpProxy
+from traffic_monitor import TrafficMonitor, MONITOR_INTERVAL
 
 
 class SecurityController(app_manager.OSKenApp):
