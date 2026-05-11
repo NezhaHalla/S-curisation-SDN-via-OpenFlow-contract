@@ -16,7 +16,7 @@ from collections import defaultdict
 # Detection thresholds
 DDOS_PACKET_THRESHOLD = 100      # packets per interval from one source
 DDOS_BYTE_THRESHOLD = 100000    # bytes per interval from one source
-PORT_SCAN_THRESHOLD = 5          # unique destinations in one interval
+PORT_SCAN_THRESHOLD = 15          # unique destinations in one interval
 MONITOR_INTERVAL = 10            # seconds between stat collections
 
 
@@ -47,6 +47,9 @@ class TrafficMonitor:
 
         # ARP tracking for port scan detection: {src_ip: set of dst_ips}
         self.arp_requests = defaultdict(set)
+
+        # Skip detection for first 2 intervals (let startup ARP settle)
+        self.warmup_remaining = 2
 
         # Detected threats
         self.alerts = []
@@ -165,7 +168,6 @@ class TrafficMonitor:
 
             pkt_delta = current['packets'] - prev['prev_packets']
             byte_delta = current['bytes'] - prev['prev_bytes']
-            num_dests = len(current['destinations'])
 
             # Update previous values
             self.host_stats[src_mac]['prev_packets'] = current['packets']
@@ -173,7 +175,7 @@ class TrafficMonitor:
             self.host_stats[src_mac]['total_packets'] = current['packets']
             self.host_stats[src_mac]['total_bytes'] = current['bytes']
 
-            # ── DDoS Detection ──
+            # ── DDoS Detection (flow-based) ──
             if pkt_delta > DDOS_PACKET_THRESHOLD:
                 self._raise_alert(
                     'DDOS_DETECTED',
@@ -185,38 +187,30 @@ class TrafficMonitor:
                     byte_rate=byte_delta,
                 )
 
-            # ── Port Scan Detection ──
-            if num_dests > PORT_SCAN_THRESHOLD:
-                self._raise_alert(
-                    'PORT_SCAN_DETECTED',
-                    'Port scan from %s: %d unique destinations '
-                    '(threshold: %d)' %
-                    (src_mac, num_dests, PORT_SCAN_THRESHOLD),
-                    src_mac=src_mac,
-                    dest_count=num_dests,
-                )
         # ── Port Scan Detection (ARP-based) ──
-        for src_ip, targets in self.arp_requests.items():
-            if len(targets) > PORT_SCAN_THRESHOLD:
-                host_info = self.topo.find_host_by_ip(src_ip)
-                if host_info:
-                    src_mac = host_info['mac']
-                    self._raise_alert(
-                        'PORT_SCAN_DETECTED',
-                        'Network scan from %s (%s): %d unique targets '
-                        'in last interval (threshold: %d)' %
-                        (src_ip, src_mac, len(targets),
-                         PORT_SCAN_THRESHOLD),
-                        src_mac=src_mac,
-                        src_ip=src_ip,
-                        dest_count=len(targets),
-                    )
+        if self.warmup_remaining > 0:
+            self.warmup_remaining -= 1
+            self.logger.info("[MONITOR] Warmup: %d intervals remaining",
+                             self.warmup_remaining)
+        else:
+            for src_ip, targets in self.arp_requests.items():
+                if len(targets) > PORT_SCAN_THRESHOLD:
+                    host_info = self.topo.find_host_by_ip(src_ip)
+                    if host_info:
+                        src_mac = host_info['mac']
+                        self._raise_alert(
+                            'PORT_SCAN_DETECTED',
+                            'Network scan from %s (%s): %d unique targets '
+                            'in last interval (threshold: %d)' %
+                            (src_ip, src_mac, len(targets),
+                             PORT_SCAN_THRESHOLD),
+                            src_mac=src_mac,
+                            src_ip=src_ip,
+                            dest_count=len(targets),
+                        )
 
-        # Clear ARP tracking for next interval
+        # Clear tracking for next interval
         self.arp_requests = defaultdict(set)
-
-
-        # Clear flow cache for next interval
         self.flow_cache = {}
 
     def _raise_alert(self, alert_type, message, **details):
