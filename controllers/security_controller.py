@@ -3,12 +3,17 @@ SDN Security Controller — Main Controller
 ==========================================
 Orchestrates all security modules:
     - TopologyManager: network graph + host database
-    - ArpProxy: handles ARP without broadcasting
-    - TrafficMonitor: collects stats + detects DDoS/port scans
+    - ArpProxy: ARP without broadcasting
+    - TrafficMonitor: stats collection + threat detection
+    - MitigationEngine: block/unblock attackers + audit log
 
 Usage:
     osken-manager controllers/security_controller.py
 """
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
@@ -18,20 +23,14 @@ from os_ken.ofproto import ofproto_v1_3
 from os_ken.lib.packet import packet, ethernet, ether_types
 from os_ken.lib import hub
 
-import networkx as nx
-
-# Our modules
-import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from topology_manager import TopologyManager
 from arp_proxy import ArpProxy
 from traffic_monitor import TrafficMonitor, MONITOR_INTERVAL
+from mitigation_engine import MitigationEngine
 
 
 class SecurityController(app_manager.OSKenApp):
-    """Main SDN Security Controller."""
+    """Main SDN Security Controller with detection and mitigation."""
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -45,12 +44,48 @@ class SecurityController(app_manager.OSKenApp):
         self.topo = TopologyManager(self.logger)
         self.arp_proxy = ArpProxy(self.topo, self.logger)
         self.monitor = TrafficMonitor(self.topo, self.logger)
+        self.mitigator = MitigationEngine(self.topo, self.logger)
+
+        # Connect detection to mitigation
+        self.monitor.register_alert_callback(self._handle_alert)
 
         self.logger.info("=" * 60)
-        self.logger.info("  SDN SECURITY CONTROLLER STARTED")
-        self.logger.info("  Modules: Topology, ARP Proxy, Traffic Monitor")
+        self.logger.info("  SDN SECURITY CONTROLLER v2.0")
+        self.logger.info("  Modules: Topology | ARP Proxy | Monitor | Mitigator")
         self.logger.info("  Waiting for 7 switches to connect...")
         self.logger.info("=" * 60)
+
+    # ══════════════════════════════════════════════════════════
+    #  ALERT HANDLING — connects detection to mitigation
+    # ══════════════════════════════════════════════════════════
+
+    def _handle_alert(self, alert):
+        """
+        Called when TrafficMonitor detects a threat.
+        Decides what action to take.
+        """
+        alert_type = alert['type']
+        details = alert['details']
+        src_mac = details.get('src_mac')
+
+        if not src_mac:
+            return
+
+        # Skip if already blocked
+        if self.mitigator.is_blocked(src_mac):
+            return
+
+        if alert_type == 'DDOS_DETECTED':
+            self.logger.warning(
+                "[ACTION] DDoS detected from %s — BLOCKING", src_mac)
+            self.mitigator.block_host(
+                src_mac, 'DDOS', self.datapaths, self._add_flow)
+
+        elif alert_type == 'PORT_SCAN_DETECTED':
+            self.logger.warning(
+                "[ACTION] Port scan detected from %s — BLOCKING", src_mac)
+            self.mitigator.block_host(
+                src_mac, 'PORT_SCAN', self.datapaths, self._add_flow)
 
     # ══════════════════════════════════════════════════════════
     #  SWITCH CONNECTION
@@ -88,10 +123,9 @@ class SecurityController(app_manager.OSKenApp):
         # Default: DROP
         self._add_flow(datapath, 0, parser.OFPMatch(), [])
 
-        # All switches connected? Install proactive rules + start monitoring
+        # All switches? Install proactive rules + start monitoring
         if len(self.datapaths) >= 7 and not self.flows_installed:
             self._install_all_flows()
-            # Start the traffic monitoring thread
             hub.spawn(self._monitor_loop)
 
     # ══════════════════════════════════════════════════════════
@@ -145,45 +179,44 @@ class SecurityController(app_manager.OSKenApp):
                         " -> ".join(["s" + str(s) for s in path]))
 
     # ══════════════════════════════════════════════════════════
-    #  TRAFFIC MONITORING (Part 2)
+    #  TRAFFIC MONITORING
     # ══════════════════════════════════════════════════════════
 
     def _monitor_loop(self):
-        """Periodically request statistics from all switches."""
+        """Periodically request stats and analyze traffic."""
         self.logger.info("[MONITOR] Started (interval: %ds)", MONITOR_INTERVAL)
         while True:
             hub.sleep(MONITOR_INTERVAL)
             for dpid, dp in self.datapaths.items():
                 self._request_stats(dp)
-            self.monitor.reset_interval_stats()
+            # Wait a moment for replies to arrive, then analyze
+            hub.sleep(2)
+            self.monitor.analyze_traffic()
 
     def _request_stats(self, datapath):
         """Send flow and port stats requests to a switch."""
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
 
-        # Request flow stats
+        # Flow stats
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
 
-        # Request port stats
-        req = parser.OFPPortStatsRequest(
-            datapath, 0, ofproto.OFPP_ANY
-        )
+        # Port stats
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
         """Handle flow statistics reply."""
-        body = ev.msg.body
-        self.monitor.process_flow_stats(body)
+        dpid = ev.msg.datapath.id
+        self.monitor.process_flow_stats(dpid, ev.msg.body)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
         """Handle port statistics reply."""
         dpid = ev.msg.datapath.id
-        body = ev.msg.body
-        self.monitor.process_port_stats(dpid, body)
+        self.monitor.process_port_stats(dpid, ev.msg.body)
 
     # ══════════════════════════════════════════════════════════
     #  PACKET-IN (ARP only)
