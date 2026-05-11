@@ -45,6 +45,9 @@ class TrafficMonitor:
         # Flow stats from last collection: {(dpid, eth_src, eth_dst): {packets, bytes}}
         self.flow_cache = {}
 
+        # ARP tracking for port scan detection: {src_ip: set of dst_ips}
+        self.arp_requests = defaultdict(set)
+
         # Detected threats
         self.alerts = []
         self.alert_callbacks = []
@@ -134,6 +137,11 @@ class TrafficMonitor:
                 return mac
         return None
 
+    def record_arp_request(self, src_ip, dst_ip):
+        """Record an ARP request. Used for port scan detection."""
+        self.arp_requests[src_ip].add(dst_ip)
+
+
     def analyze_traffic(self):
         """
         Analyze collected flow stats to detect threats.
@@ -187,6 +195,26 @@ class TrafficMonitor:
                     src_mac=src_mac,
                     dest_count=num_dests,
                 )
+        # ── Port Scan Detection (ARP-based) ──
+        for src_ip, targets in self.arp_requests.items():
+            if len(targets) > PORT_SCAN_THRESHOLD:
+                host_info = self.topo.find_host_by_ip(src_ip)
+                if host_info:
+                    src_mac = host_info['mac']
+                    self._raise_alert(
+                        'PORT_SCAN_DETECTED',
+                        'Network scan from %s (%s): %d unique targets '
+                        'in last interval (threshold: %d)' %
+                        (src_ip, src_mac, len(targets),
+                         PORT_SCAN_THRESHOLD),
+                        src_mac=src_mac,
+                        src_ip=src_ip,
+                        dest_count=len(targets),
+                    )
+
+        # Clear ARP tracking for next interval
+        self.arp_requests = defaultdict(set)
+
 
         # Clear flow cache for next interval
         self.flow_cache = {}

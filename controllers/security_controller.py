@@ -20,7 +20,7 @@ from os_ken.controller import ofp_event
 from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from os_ken.controller.handler import set_ev_cls
 from os_ken.ofproto import ofproto_v1_3
-from os_ken.lib.packet import packet, ethernet, ether_types
+from os_ken.lib.packet import packet, ethernet, ether_types ,arp
 from os_ken.lib import hub
 
 from topology_manager import TopologyManager
@@ -235,7 +235,7 @@ class SecurityController(app_manager.OSKenApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Handle ARP requests via the ARP proxy module."""
+        """Handle ARP requests: proxy reply + track for port scan detection."""
         msg = ev.msg
         datapath = msg.datapath
         in_port = msg.match['in_port']
@@ -246,6 +246,12 @@ class SecurityController(app_manager.OSKenApp):
         if not eth or eth.ethertype != ether_types.ETH_TYPE_ARP:
             return
 
+        # Track ARP requests for port scan detection
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
+            self.monitor.record_arp_request(arp_pkt.src_ip, arp_pkt.dst_ip)
+
+        # Let ARP proxy handle the reply
         self.arp_proxy.handle_arp(datapath, in_port, msg.data)
 
     # ══════════════════════════════════════════════════════════
