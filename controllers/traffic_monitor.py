@@ -98,21 +98,29 @@ class TrafficMonitor:
             prev = self.port_stats[port_key]
 
             rx_rate = stat.rx_packets - prev['prev_rx_packets']
+            tx_rate = stat.tx_packets - prev.get('prev_tx_packets', 0)
 
             self.port_stats[port_key] = {
                 'prev_rx_packets': stat.rx_packets,
                 'prev_tx_packets': stat.tx_packets,
             }
 
-            if rx_rate > DDOS_PACKET_THRESHOLD and prev['prev_rx_packets'] > 0:
-                # Check if this port connects to a host
+            # Only flag if:
+            #   1. High RX (host sending lots of packets INTO the network)
+            #   2. RX >> TX (one-directional = real attack, not ping reply)
+            #   3. Not first interval (need baseline)
+            if (rx_rate > DDOS_PACKET_THRESHOLD and
+                    prev['prev_rx_packets'] > 0 and
+                    rx_rate > 3 * max(tx_rate, 1)):
+
                 host_mac = self._find_host_on_port(dpid, port_no)
                 if host_mac:
                     self._raise_alert(
                         'DDOS_DETECTED',
-                        'High traffic from %s on s%d port %d: '
-                        '%d packets/interval' %
-                        (host_mac, dpid, port_no, rx_rate),
+                        'One-way flood from %s on s%d port %d: '
+                        '%d pkts sent, %d pkts received (ratio: %.1f)' %
+                        (host_mac, dpid, port_no, rx_rate, tx_rate,
+                         rx_rate / max(tx_rate, 1)),
                         src_mac=host_mac,
                         dpid=dpid,
                         port=port_no,
