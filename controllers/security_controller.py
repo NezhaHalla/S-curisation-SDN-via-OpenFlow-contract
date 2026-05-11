@@ -39,6 +39,7 @@ class SecurityController(app_manager.OSKenApp):
 
         self.datapaths = {}
         self.flows_installed = False
+        self.blocks_this_interval = 0  
 
         # Initialize modules
         self.topo = TopologyManager(self.logger)
@@ -62,7 +63,8 @@ class SecurityController(app_manager.OSKenApp):
     def _handle_alert(self, alert):
         """
         Called when TrafficMonitor detects a threat.
-        Decides what action to take.
+        Rate-limited: max 1 auto-block per monitoring interval
+        to avoid blocking victims (false positives).
         """
         alert_type = alert['type']
         details = alert['details']
@@ -75,17 +77,26 @@ class SecurityController(app_manager.OSKenApp):
         if self.mitigator.is_blocked(src_mac):
             return
 
+        # Only auto-block ONE host per interval (avoid blocking victims)
+        if self.blocks_this_interval >= 1:
+            self.logger.info(
+                "[ACTION] Alert for %s deferred — already blocked 1 host "
+                "this interval (possible victim)", src_mac)
+            return
+
         if alert_type == 'DDOS_DETECTED':
             self.logger.warning(
                 "[ACTION] DDoS detected from %s — BLOCKING", src_mac)
             self.mitigator.block_host(
                 src_mac, 'DDOS', self.datapaths, self._add_flow)
+            self.blocks_this_interval += 1
 
         elif alert_type == 'PORT_SCAN_DETECTED':
             self.logger.warning(
                 "[ACTION] Port scan detected from %s — BLOCKING", src_mac)
             self.mitigator.block_host(
                 src_mac, 'PORT_SCAN', self.datapaths, self._add_flow)
+            self.blocks_this_interval += 1
 
     # ══════════════════════════════════════════════════════════
     #  SWITCH CONNECTION
@@ -187,9 +198,9 @@ class SecurityController(app_manager.OSKenApp):
         self.logger.info("[MONITOR] Started (interval: %ds)", MONITOR_INTERVAL)
         while True:
             hub.sleep(MONITOR_INTERVAL)
+            self.blocks_this_interval = 0   
             for dpid, dp in self.datapaths.items():
                 self._request_stats(dp)
-            # Wait a moment for replies to arrive, then analyze
             hub.sleep(2)
             self.monitor.analyze_traffic()
 
